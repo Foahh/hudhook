@@ -12,9 +12,9 @@ use tracing::{error, trace};
 use windows::core::{Error, Interface, Result, BOOL, HRESULT};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct3D9::{
-    Direct3DCreate9, IDirect3DDevice9, IDirect3DSwapChain9, D3DADAPTER_DEFAULT,
-    D3DBACKBUFFER_TYPE_MONO, D3DCREATE_SOFTWARE_VERTEXPROCESSING, D3DDEVTYPE_NULLREF,
-    D3DDISPLAYMODE, D3DFORMAT, D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_DISCARD, D3D_SDK_VERSION,
+    Direct3DCreate9, IDirect3DDevice9, D3DADAPTER_DEFAULT, D3DBACKBUFFER_TYPE_MONO,
+    D3DCREATE_SOFTWARE_VERTEXPROCESSING, D3DDEVTYPE_NULLREF, D3DDISPLAYMODE, D3DFORMAT,
+    D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_DISCARD, D3D_SDK_VERSION,
 };
 use windows::Win32::Graphics::Gdi::RGNDATA;
 
@@ -34,18 +34,11 @@ type Dx9PresentType = unsafe extern "system" fn(
 type Dx9ResetType =
     unsafe extern "system" fn(this: IDirect3DDevice9, *const D3DPRESENT_PARAMETERS) -> HRESULT;
 
-type Dx9SwapChainPresentType = unsafe extern "system" fn(
-    this: IDirect3DSwapChain9,
-    psourcerect: *const RECT,
-    pdestrect: *const RECT,
-    hdestwindowoverride: HWND,
-    pdirtyregion: *const RGNDATA,
-    flags: u32,
-) -> HRESULT;
+type Dx9EndSceneType = unsafe extern "system" fn(this: IDirect3DDevice9) -> HRESULT;
 
 struct Trampolines {
     dx9_present: Dx9PresentType,
-    dx9_swap_chain_present: Dx9SwapChainPresentType,
+    dx9_end_scene: Dx9EndSceneType,
     dx9_reset: Dx9ResetType,
 }
 
@@ -96,8 +89,7 @@ fn render(device: &IDirect3DDevice9) -> Result<()> {
     render_result
 }
 
-fn render_swap_chain(swap_chain: &IDirect3DSwapChain9) -> Result<()> {
-    let device = unsafe { swap_chain.GetDevice() }?;
+fn render_current_target(device: &IDirect3DDevice9) -> Result<()> {
     let pipeline = unsafe { PIPELINE.get_or_try_init(|| init_pipeline(&device)) }?;
 
     let Some(mut pipeline) = pipeline.try_lock() else {
@@ -107,13 +99,8 @@ fn render_swap_chain(swap_chain: &IDirect3DSwapChain9) -> Result<()> {
 
     pipeline.prepare_render()?;
 
-    let surface = unsafe { swap_chain.GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO) }?;
-
-    unsafe { device.BeginScene() }?;
-    let render_result = pipeline.render(surface);
-    unsafe { device.EndScene() }?;
-
-    render_result
+    let surface = unsafe { device.GetRenderTarget(0) }?;
+    pipeline.render(surface)
 }
 
 unsafe extern "system" fn dx9_present_impl(
@@ -140,32 +127,18 @@ unsafe extern "system" fn dx9_present_impl(
     result
 }
 
-unsafe extern "system" fn dx9_swap_chain_present_impl(
-    swap_chain: IDirect3DSwapChain9,
-    psourcerect: *const RECT,
-    pdestrect: *const RECT,
-    hdestwindowoverride: HWND,
-    pdirtyregion: *const RGNDATA,
-    flags: u32,
-) -> HRESULT {
+unsafe extern "system" fn dx9_end_scene_impl(device: IDirect3DDevice9) -> HRESULT {
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
 
-    let Trampolines { dx9_swap_chain_present, .. } =
+    let Trampolines { dx9_end_scene, .. } =
         TRAMPOLINES.get().expect("DirectX 9 trampolines uninitialized");
 
-    if let Err(e) = render_swap_chain(&swap_chain) {
+    if let Err(e) = render_current_target(&device) {
         error!("Render error: {e:?}");
     }
 
-    trace!("Call IDirect3DSwapChain9::Present trampoline");
-    let result = dx9_swap_chain_present(
-        swap_chain,
-        psourcerect,
-        pdestrect,
-        hdestwindowoverride,
-        pdirtyregion,
-        flags,
-    );
+    trace!("Call IDirect3DDevice9::EndScene trampoline");
+    let result = dx9_end_scene(device);
     if EJECT_REQUESTED.load(Ordering::SeqCst) {
         perform_eject();
     }
@@ -191,7 +164,7 @@ unsafe extern "system" fn dx9_reset_impl(
     dx9_reset(this, present_params)
 }
 
-fn get_target_addrs() -> (Dx9PresentType, Dx9SwapChainPresentType, Dx9ResetType) {
+fn get_target_addrs() -> (Dx9PresentType, Dx9EndSceneType, Dx9ResetType) {
     let d9 = unsafe { Direct3DCreate9(D3D_SDK_VERSION).unwrap() };
 
     let mut d3d_display_mode =
@@ -221,9 +194,8 @@ fn get_target_addrs() -> (Dx9PresentType, Dx9SwapChainPresentType, Dx9ResetType)
     .expect("IDirect3DDevice9::CreateDevice: failed to create device");
 
     let present_ptr = device.vtable().Present;
+    let end_scene_ptr = device.vtable().EndScene;
     let reset_ptr = device.vtable().Reset;
-    let swap_chain = unsafe { device.GetSwapChain(0).expect("IDirect3DDevice9::GetSwapChain") };
-    let swap_chain_present_ptr = swap_chain.vtable().Present;
 
     unsafe {
         (
@@ -238,16 +210,9 @@ fn get_target_addrs() -> (Dx9PresentType, Dx9SwapChainPresentType, Dx9ResetType)
                 Dx9PresentType,
             >(present_ptr),
             mem::transmute::<
-                unsafe extern "system" fn(
-                    *mut c_void,
-                    *const RECT,
-                    *const RECT,
-                    HWND,
-                    *const RGNDATA,
-                    u32,
-                ) -> HRESULT,
-                Dx9SwapChainPresentType,
-            >(swap_chain_present_ptr),
+                unsafe extern "system" fn(*mut c_void) -> HRESULT,
+                Dx9EndSceneType,
+            >(end_scene_ptr),
             mem::transmute::<
                 unsafe extern "system" fn(*mut c_void, *mut D3DPRESENT_PARAMETERS) -> HRESULT,
                 Dx9ResetType,
@@ -265,7 +230,7 @@ impl ImguiDx9Hooks {
     ///
     /// The following functions are hooked:
     /// - `IDirect3DDevice9::Present`
-    /// - `IDirect3DSwapChain9::Present`
+    /// - `IDirect3DDevice9::EndScene`
     ///
     /// # Safety
     ///
@@ -274,34 +239,29 @@ impl ImguiDx9Hooks {
     where
         T: ImguiRenderLoop + Send + Sync + 'static,
     {
-        let (dx9_present_addr, dx9_swap_chain_present_addr, dx9_reset_addr) = get_target_addrs();
+        let (dx9_present_addr, dx9_end_scene_addr, dx9_reset_addr) = get_target_addrs();
 
         trace!("IDirect3DDevice9::Present = {:p}", dx9_present_addr as *const c_void);
         let hook_present =
             MhHook::new(dx9_present_addr as *mut c_void, dx9_present_impl as *mut c_void)
                 .expect("couldn't create IDirect3DDevice9::Present hook");
-        trace!(
-            "IDirect3DSwapChain9::Present = {:p}",
-            dx9_swap_chain_present_addr as *const c_void
-        );
-        let hook_swap_chain_present = MhHook::new(
-            dx9_swap_chain_present_addr as *mut c_void,
-            dx9_swap_chain_present_impl as *mut c_void,
-        )
-        .expect("couldn't create IDirect3DSwapChain9::Present hook");
+        trace!("IDirect3DDevice9::EndScene = {:p}", dx9_end_scene_addr as *const c_void);
+        let hook_end_scene =
+            MhHook::new(dx9_end_scene_addr as *mut c_void, dx9_end_scene_impl as *mut c_void)
+                .expect("couldn't create IDirect3DDevice9::EndScene hook");
         let hook_reset = MhHook::new(dx9_reset_addr as *mut c_void, dx9_reset_impl as *mut c_void)
             .expect("couldn't create IDirect3DDevice9::Reset hook");
 
         RENDER_LOOP.get_or_init(|| Box::new(t));
         TRAMPOLINES.get_or_init(|| Trampolines {
             dx9_present: mem::transmute::<*mut c_void, Dx9PresentType>(hook_present.trampoline()),
-            dx9_swap_chain_present: mem::transmute::<*mut c_void, Dx9SwapChainPresentType>(
-                hook_swap_chain_present.trampoline(),
+            dx9_end_scene: mem::transmute::<*mut c_void, Dx9EndSceneType>(
+                hook_end_scene.trampoline(),
             ),
             dx9_reset: mem::transmute::<*mut c_void, Dx9ResetType>(hook_reset.trampoline()),
         });
 
-        Self([hook_present, hook_swap_chain_present, hook_reset])
+        Self([hook_present, hook_end_scene, hook_reset])
     }
 }
 
